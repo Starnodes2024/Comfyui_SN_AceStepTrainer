@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Models (auto-downloaded, too large for git)
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+silence_latent.pt
+
+# Training output
+output/
+
+# Dev files (not for release)
+PLAN.md
+knowledge.md
+progress.md
+instructions.txt
+inspect_tensor.py
+release/
+
+# Logs
+*.log
