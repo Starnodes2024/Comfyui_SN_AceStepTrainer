@@ -527,14 +527,14 @@ def train_lora(
             if global_step >= max_steps:
                 done = True
 
-    # Notify frontend that training is done
-    _send_training_event({"type": "done"})
-
     # Save final LoRA
     total_time = time.time() - training_start
     final_name = f"{lora_name}_final.safetensors"
     final_path = os.path.join(output_dir, final_name)
     save_lora_safetensors(dit_model, final_path, alpha=alpha, rank=rank, dropout=dropout)
+
+    # Notify frontend that training is done (include final path for loss graph display)
+    _send_training_event({"type": "done", "final_path": final_path})
 
     print("=" * 70)
     print("[AceStep Train] Training complete!")

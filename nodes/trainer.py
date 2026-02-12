@@ -6,6 +6,7 @@ Saves LoRA as single-file .safetensors at intervals and at completion.
 """
 
 import os
+import math
 import logging
 
 from comfy.utils import ProgressBar
@@ -55,12 +56,12 @@ class AceStep15LoRATrainer:
                     "step": 0.00001,
                     "tooltip": "How fast the model learns. Too high = unstable training, too low = very slow progress. Default 1e-4 (0.0001) is a safe starting point. Try 5e-5 for larger datasets or 2e-4 for very small ones (3-5 files). Watch the loss in the CMD console — if it spikes, lower this.",
                 }),
-                "max_steps": ("INT", {
-                    "default": 1000,
-                    "min": 100,
-                    "max": 100000,
-                    "step": 10,
-                    "tooltip": "Total number of optimizer steps (weight updates) to train. Each step processes batch_size x gradient_accumulation samples. For small datasets (3-10 files) try 300-1000. For larger datasets (10-50 files) try 500-3000. You can always stop early \u2014 saved checkpoints are fully usable. A progress bar shows on this node during training.",
+                "epochs": ("INT", {
+                    "default": 100,
+                    "min": 1,
+                    "max": 10000,
+                    "step": 1,
+                    "tooltip": "Number of full passes through your dataset. One epoch = every sample seen once. The total optimizer steps are calculated automatically: steps = epochs × ceil(samples / batch_size) / gradient_accumulation. For small datasets (3-10 files) try 50-200 epochs. For larger ones (10-50 files) try 20-100. The loss graph shows individual steps for fine-grained monitoring.",
                 }),
                 "batch_size": ("INT", {
                     "default": 1,
@@ -72,14 +73,14 @@ class AceStep15LoRATrainer:
                     "default": 4,
                     "min": 1,
                     "max": 64,
-                    "tooltip": "Simulates a larger batch size without extra VRAM. Gradients are accumulated over this many steps before updating weights. Effective batch = batch_size x this value. Default 4 means the model updates after seeing 4 samples. Increase to 8-16 for smoother, more stable training.",
+                    "tooltip": "Simulates a larger batch size without extra VRAM. Gradients are accumulated over this many steps before updating weights. Effective batch = batch_size × this value. Default 4 means the model updates after seeing 4 samples. Increase to 8-16 for smoother, more stable training.",
                 }),
-                "save_every_n_steps": ("INT", {
-                    "default": 250,
+                "save_every_n_epochs": ("INT", {
+                    "default": 10,
                     "min": 0,
-                    "max": 10000,
-                    "step": 50,
-                    "tooltip": "Saves a LoRA checkpoint every N optimizer steps (e.g. my_lora_250steps.safetensors). This way you can stop training anytime and still have usable checkpoints. Set to 0 to only save the final result. Tip: start with 100-250 so you can compare quality at different training stages.",
+                    "max": 1000,
+                    "step": 1,
+                    "tooltip": "Saves a LoRA checkpoint every N epochs (e.g. my_lora_250steps.safetensors). This way you can stop training anytime and still have usable checkpoints. Set to 0 to only save the final result. Tip: start with 10-25 so you can compare quality at different stages.",
                 }),
                 "seed": ("INT", {
                     "default": 42,
@@ -106,8 +107,8 @@ class AceStep15LoRATrainer:
     OUTPUT_NODE = True
 
     def train(self, existing_dataset, lora_name, lora_rank, lora_alpha,
-              learning_rate, max_steps, batch_size, gradient_accumulation,
-              save_every_n_steps, seed, tensor_path=None,
+              learning_rate, epochs, batch_size, gradient_accumulation,
+              save_every_n_epochs, seed, tensor_path=None,
               resume_from_checkpoint=None):
 
         # Determine tensor directory
@@ -126,6 +127,13 @@ class AceStep15LoRATrainer:
         if not pt_files:
             return (f"ERROR: No .pt tensor files found in {tensor_dir}. Run Preprocessor first.",)
 
+        # Calculate max_steps and save interval from epochs
+        num_samples = len(pt_files)
+        batches_per_epoch = math.ceil(num_samples / batch_size)
+        steps_per_epoch = max(1, math.ceil(batches_per_epoch / gradient_accumulation))
+        max_steps = epochs * steps_per_epoch
+        save_every_n_steps = save_every_n_epochs * steps_per_epoch if save_every_n_epochs > 0 else 0
+
         # Output directory
         output_dir = str(get_trained_dir(lora_name))
 
@@ -139,11 +147,12 @@ class AceStep15LoRATrainer:
 
         print("=" * 70)
         print(f"[AceStep Train] LoRA Training Configuration:")
-        print(f"  Dataset: {tensor_dir} ({len(pt_files)} samples)")
+        print(f"  Dataset: {tensor_dir} ({num_samples} samples)")
         print(f"  Output: {output_dir}")
         print(f"  LoRA: rank={lora_rank}, alpha={lora_alpha}")
-        print(f"  Training: max_steps={max_steps}, batch={batch_size}, grad_accum={gradient_accumulation}")
-        print(f"  LR: {learning_rate}, Save every: {save_every_n_steps} steps")
+        print(f"  Epochs: {epochs}, Steps/epoch: {steps_per_epoch}, Total steps: {max_steps}")
+        print(f"  Batch: {batch_size}, Grad accum: {gradient_accumulation}")
+        print(f"  LR: {learning_rate}, Save every: {save_every_n_epochs} epochs ({save_every_n_steps} steps)")
         if resume_path:
             print(f"  Resume from: {resume_path}")
         print("=" * 70)

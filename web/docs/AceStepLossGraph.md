@@ -16,9 +16,13 @@ A real-time training loss visualization node. Displays a live-updating loss curv
 - **Auto-scaling Y-axis** that adjusts as loss decreases
 - **Subtle grid lines** for easy reading
 - **Stats overlay** showing: Current Step, Loss, Learning Rate, and ETA
+- **Final LoRA path**: When training finishes, the save location is displayed directly in the graph — no extra "Show Text" node needed
 - **Status pill**: Green "TRAINING" during training, blue "DONE" when finished
 - **Pulsing dot** on the latest data point
 - **Responsive**: Resizes with the node when dragged
+
+## Epochs vs Steps
+The **Trainer node** uses **epochs** (full dataset passes) as its input, but the **Loss Graph** displays individual optimizer **steps** for fine-grained monitoring. This gives you the best of both worlds: an intuitive training duration setting (epochs) and detailed loss tracking (steps). See the Trainer node docs for a full explanation of how epochs convert to steps.
 
 ## Usage
 1. Add the **⭐SN AceStep Loss Graph** node to your workflow

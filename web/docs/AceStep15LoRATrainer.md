@@ -11,10 +11,10 @@ Trains LoRA (Low-Rank Adaptation) adapters on the ACE-Step DiT decoder using pre
 - **lora_rank**: LoRA rank (default: 64). Higher rank = more expressive capacity but larger file. Common values: 8, 16, 32, 64, 128.
 - **lora_alpha**: LoRA alpha scaling factor (default: 128). A good rule of thumb is 2x the rank.
 - **learning_rate**: Initial learning rate (default: 1e-4). Lower values (5e-5) for larger datasets, higher (2e-4) for very small datasets.
-- **max_steps**: Total number of optimizer steps to train (default: 1000). Each step processes batch_size x gradient_accumulation samples.
+- **epochs**: Number of full passes through your dataset (default: 100). One epoch = every sample seen once. The total optimizer steps are calculated automatically. See "Epochs vs Steps" below.
 - **batch_size**: Number of samples per training step (default: 1). Keep at 1 for small datasets or limited VRAM.
 - **gradient_accumulation**: Number of steps to accumulate gradients before updating weights (default: 4). Effective batch size = batch_size x gradient_accumulation.
-- **save_every_n_steps**: Save a LoRA checkpoint every N optimizer steps (default: 250). Set to 0 to only save the final result. Files are named like `my_lora_250steps.safetensors`.
+- **save_every_n_epochs**: Save a LoRA checkpoint every N epochs (default: 10). Set to 0 to only save the final result. Files are named like `my_lora_250steps.safetensors`.
 - **seed**: Random seed for reproducibility (default: 42).
 
 ### Optional
@@ -32,22 +32,33 @@ Trains LoRA (Low-Rank Adaptation) adapters on the ACE-Step DiT decoder using pre
 5. Watch the CMD console for live progress updates
 6. Find your LoRA files in `output/AceLora/Trained/{lora_name}/`
 
+## Epochs vs Steps
+
+The trainer uses **epochs** as the primary training duration setting. Here's how they relate:
+
+- **Epoch**: One full pass through your entire dataset. If you have 10 audio files, one epoch processes all 10.
+- **Step**: One optimizer weight update. With `batch_size=1` and `gradient_accumulation=4`, one step processes 4 samples.
+- **Steps per epoch**: `ceil(num_samples / batch_size) / gradient_accumulation`. For example, 10 samples with batch=1 and grad_accum=4 gives ~3 steps per epoch.
+- **Total steps**: `epochs x steps_per_epoch`. The loss graph shows individual steps for fine-grained monitoring.
+
+The CMD console and loss graph always display the current **step** count, so you can monitor training at a granular level even though you set **epochs** in the node.
+
 ## Training Tips
 
 ### Small Datasets (3-10 files)
 - Rank: 32-64
-- Epochs: 300-500
+- Epochs: 100-200
 - Learning rate: 1e-4
 - Gradient accumulation: 4-8
 
 ### Medium Datasets (10-50 files)
 - Rank: 64-128
-- Epochs: 100-300
+- Epochs: 50-100
 - Learning rate: 5e-5
 - Gradient accumulation: 4
 
 ### General Advice
-- **Start with `save_every_n_steps: 100`** so you can test early checkpoints
+- **Start with `save_every_n_epochs: 10`** so you can test early checkpoints
 - **Watch the loss** in the CMD console — it should steadily decrease
 - If loss stops decreasing, you can stop training and use the last saved checkpoint
 - Higher rank captures more detail but risks overfitting on small datasets
@@ -73,8 +84,8 @@ Trains LoRA (Low-Rank Adaptation) adapters on the ACE-Step DiT decoder using pre
 ## Technical Details
 - LoRA is injected into DiT decoder attention layers: `q_proj`, `k_proj`, `v_proj`, `o_proj`
 - Training uses flow matching loss with 8 discrete turbo timesteps
-- Optimizer: AdamW (betas=0.8, 0.9) with linear warmup + linear decay schedule
-- Mixed precision: bfloat16 on CUDA
+- Optimizer: AdamW (default betas 0.9, 0.999) with linear warmup + cosine annealing schedule
+- Mixed precision: bfloat16 autocast on CUDA
 - Requires ~8 GB VRAM minimum (DiT model + LoRA gradients)
 
 ## Using Your Trained LoRA
@@ -88,10 +99,10 @@ You can test different checkpoints (e.g. `my_lora_250steps.safetensors` vs `my_l
 
 ## Resume Training
 Training can be paused and resumed later:
-1. Train with `max_steps=1000`, `save_every_n_steps=250` — checkpoints saved at steps 250, 500, 750
+1. Train with `epochs=100`, `save_every_n_epochs=10` — checkpoints saved every 10 epochs
 2. Stop training (or let it finish early)
 3. Later: select a checkpoint from the `resume_from_checkpoint` dropdown (e.g. `my_lora/my_lora_500steps_checkpoint.pt`)
-4. Set `max_steps=1000` again — training continues from step 501 with the same optimizer state
+4. Set `epochs=100` again — training continues from the saved step with the same optimizer state
 
 Checkpoint `.pt` files contain: LoRA weights, optimizer state, LR scheduler state, RNG states, and training config.
 

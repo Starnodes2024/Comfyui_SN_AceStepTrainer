@@ -44,6 +44,7 @@ app.registerExtension({
             this._eta        = "";
             this._running    = false;
             this._finished   = false;
+            this._finalPath  = "";
 
             // Ensure a reasonable minimum size
             this.size = this.size || [420, 280];
@@ -78,6 +79,7 @@ app.registerExtension({
                 } else if (d.type === "done") {
                     this._running  = false;
                     this._finished = true;
+                    this._finalPath = d.final_path || "";
                 }
 
                 // Request a canvas redraw
@@ -103,7 +105,7 @@ app.registerExtension({
             const PAD_R = 16;
             const PAD_T = 10;
             const PAD_B = 36;   // bottom padding (X-axis labels)
-            const STAT_H = 52;  // height of the stats overlay band
+            const STAT_H = this._finalPath ? 72 : 52;  // taller when showing save path
 
             const w = this.size[0];
             const h = this.size[1];
@@ -289,6 +291,22 @@ app.registerExtension({
             ctx.fillStyle = TEXT_COLOR;
             ctx.font = STAT_FONT;
             ctx.fillText(this._eta || "—", col2 + 38, statsY + 25);
+
+            // Row 3: final LoRA path (only when training is done)
+            if (this._finalPath) {
+                ctx.font = TITLE_FONT;
+                ctx.fillStyle = AXIS_COLOR;
+                ctx.fillText("Saved", col1, statsY + 46);
+                ctx.fillStyle = "#58a6ff";
+                ctx.font = "11px 'Segoe UI', Consolas, monospace";
+                // Truncate path to fit widget width
+                let displayPath = this._finalPath;
+                const maxPathW = w - col1 - 60;
+                while (ctx.measureText(displayPath).width > maxPathW && displayPath.length > 20) {
+                    displayPath = "\u2026" + displayPath.slice(displayPath.indexOf("\\", 4) + 1 || displayPath.indexOf("/", 4) + 1 || 5);
+                }
+                ctx.fillText(displayPath, col1 + 44, statsY + 46);
+            }
 
             // Status pill
             if (this._running || this._finished) {

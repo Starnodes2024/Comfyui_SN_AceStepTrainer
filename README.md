@@ -75,18 +75,29 @@ Open the `.txt` files in `output/AceLora/Dataset/{name}/` and refine captions, l
 
 ### Step 4: Trainer
 1. Select the preprocessed dataset
-2. Configure LoRA rank, learning rate, steps, etc.
+2. Configure LoRA rank, learning rate, epochs, etc.
 3. Optionally select a checkpoint to resume from
 4. Run — training blocks the node and logs progress to the CMD console
 5. Connect the **⭐SN AceStep Loss Graph (Beta)** node to see real-time loss visualization
 6. Checkpoints are saved at intervals: `my_lora_250steps.safetensors` + `my_lora_250steps_checkpoint.pt`
 7. Final result: `my_lora_final.safetensors`
+8. The **Loss Graph** node shows the final LoRA save path when training finishes
+
+### Epochs vs Steps
+
+The trainer uses **epochs** (full dataset passes) as input. Steps are calculated automatically:
+- **Epoch** = one full pass through all your audio samples
+- **Step** = one optimizer weight update (processes `batch_size x gradient_accumulation` samples)
+- **Steps per epoch** = `ceil(samples / batch_size) / gradient_accumulation`
+- The **Loss Graph** displays individual steps for fine-grained monitoring
+
+For example: 10 samples, batch=1, grad_accum=4 → ~3 steps/epoch. Setting epochs=100 gives ~300 total steps.
 
 ### Resume Training
 Training can be paused and resumed:
-1. Train with `save_every_n_steps=250` — checkpoint `.pt` files are saved alongside LoRA weights
+1. Train with `save_every_n_epochs=10` — checkpoint `.pt` files are saved alongside LoRA weights
 2. Later: select a checkpoint from the `resume_from_checkpoint` dropdown
-3. Training continues from that step with the same optimizer state, LR schedule, and RNG
+3. Training continues from the saved step with the same optimizer state, LR schedule, and RNG
 
 ## Models (auto-downloaded)
 
@@ -130,10 +141,10 @@ ComfyUI/
 
 ## Training Tips
 
-- **Small datasets (3–10 files)**: Use rank 32–64, 300–500 steps, LR 1e-4
-- **Medium datasets (10–50 files)**: Use rank 64–128, 500–3000 steps, LR 5e-5
+- **Small datasets (3–10 files)**: Use rank 32–64, 100–200 epochs, LR 1e-4
+- **Medium datasets (10–50 files)**: Use rank 64–128, 50–100 epochs, LR 5e-5
 - **Gradient accumulation**: Increase to 8–16 for more stable training with small batches
-- **Save frequently**: Set `save_every_n_steps` to 100–250 so you can test early checkpoints
+- **Save frequently**: Set `save_every_n_epochs` to 10–25 so you can test early checkpoints
 - **Activation tags**: Use a unique tag like `mystyle` so the LoRA only activates when you want it
 - **Watch the loss graph**: Loss should steadily decrease. If it spikes, lower the learning rate.
 
