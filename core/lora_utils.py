@@ -128,20 +128,24 @@ def extract_lora_state_dict(model, adapter_name: str = "lora_adapter", alpha: in
     return lora_state
 
 
-def save_lora_safetensors(model, output_path: str, alpha: int = 128, **kwargs) -> str:
+def save_lora_safetensors(model, output_path: str, alpha: int = 128, rank: int = 64, dropout: float = 0.1, **kwargs) -> str:
     """Save LoRA weights as a single .safetensors file.
 
     Uses the official ACE-Step LoRA format (base_model.model.* keys, bfloat16).
     Includes per-module .alpha tensors for correct scaling in ComfyUI.
+    Embeds LoRA config as safetensors metadata for portability.
 
     Args:
         model: Model with LoRA adapters
         output_path: Full path for the output .safetensors file
         alpha: LoRA alpha value (saved as .alpha tensors for ComfyUI)
+        rank: LoRA rank (saved in metadata)
+        dropout: LoRA dropout (saved in metadata)
 
     Returns:
         Path to saved file
     """
+    import json
     from safetensors.torch import save_file
 
     lora_state = extract_lora_state_dict(model, alpha=alpha)
@@ -160,8 +164,18 @@ def save_lora_safetensors(model, output_path: str, alpha: int = 128, **kwargs) -
         max_norm = max(weight_norms)
         print(f"[AceStep LoRA] Weight stats: avg_norm={avg_norm:.6f}, max_norm={max_norm:.6f}, n_weights={len(weight_norms)}")
 
+    # Embed LoRA config as safetensors metadata for portability
+    metadata = {
+        "format": "ace_step_lora",
+        "lora_rank": str(rank),
+        "lora_alpha": str(alpha),
+        "lora_dropout": str(dropout),
+        "target_modules": json.dumps(["q_proj", "k_proj", "v_proj", "o_proj"]),
+        "model": "ACE-Step-1.5-turbo-shift3",
+    }
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    save_file(lora_state, output_path)
+    save_file(lora_state, output_path, metadata=metadata)
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"[AceStep LoRA] Saved {len(lora_state)} tensors to {output_path} ({size_mb:.1f} MB)")

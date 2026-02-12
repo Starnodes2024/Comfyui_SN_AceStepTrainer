@@ -15,8 +15,9 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from contextlib import nullcontext
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingWarmRestarts, SequentialLR
 from torch.utils.data import Dataset, DataLoader
 
 from .lora_utils import inject_lora, save_lora_safetensors
@@ -223,7 +224,7 @@ def train_lora(
     # which AceStepDiTModel doesn't implement. Set the flag directly instead.
     dit_model.decoder.gradient_checkpointing = True
 
-    # Setup optimizer (only LoRA parameters) — betas match original ACE-Step trainer
+    # Setup optimizer (only LoRA parameters) — matches original ACE-Step 1.5 trainer
     trainable_params = [p for p in dit_model.parameters() if p.requires_grad]
     if not trainable_params:
         return "ERROR: No trainable parameters found after LoRA injection!"
@@ -231,25 +232,34 @@ def train_lora(
     optimizer_kwargs = {
         "lr": learning_rate,
         "weight_decay": weight_decay,
-        "betas": (0.8, 0.9),
+        # Use default AdamW betas (0.9, 0.999) — matches original ACE-Step 1.5 source
     }
     if device.type == "cuda":
         optimizer_kwargs["fused"] = True
     optimizer = AdamW(trainable_params, **optimizer_kwargs)
 
-    # LR scheduler: linear warmup then linear decay (matches original ACE-Step trainer)
+    # LR scheduler: linear warmup then cosine annealing (matches original ACE-Step 1.5 source)
     batches_per_epoch = len(dataloader)
     steps_per_epoch = max(1, math.ceil(batches_per_epoch / gradient_accumulation))
     warmup_steps = min(warmup_steps, max(1, max_steps // 10))
 
-    def lr_lambda(current_step):
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        else:
-            progress = float(current_step - warmup_steps) / float(max(1, max_steps - warmup_steps))
-            return max(0.0, 1.0 - progress)
-
-    scheduler = LambdaLR(optimizer, lr_lambda)
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    main_scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=max(1, max_steps - warmup_steps),
+        T_mult=1,
+        eta_min=learning_rate * 0.01,
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, main_scheduler],
+        milestones=[warmup_steps],
+    )
 
     # Ensure entire model is on correct device and dtype, then set decoder to train mode
     dit_model = dit_model.to(device=device, dtype=dtype)
@@ -325,6 +335,14 @@ def train_lora(
     training_start = time.time()
     timesteps_tensor = torch.tensor(TURBO_SHIFT3_TIMESTEPS, device=device, dtype=dtype)
 
+    # Mixed precision autocast context (matches original ACE-Step 1.5 source)
+    # autocast keeps some ops in fp32 (softmax, layer norm, loss) for numerical stability
+    device_type = device.type
+    if device_type in ("cuda", "xpu", "mps"):
+        autocast_ctx = torch.autocast(device_type=device_type, dtype=dtype)
+    else:
+        autocast_ctx = nullcontext()
+
     # Fast-forward the progress bar if resuming
     if resume_step > 0 and progress_callback is not None:
         progress_callback(resume_step, max_steps)
@@ -354,7 +372,7 @@ def train_lora(
             x1 = torch.randn_like(target_latents)  # noise
             x0 = target_latents  # data
 
-            # Sample timestep from discrete turbo schedule (matches original ACE-Step trainer)
+            # Sample timestep from discrete turbo schedule (matches original ACE-Step 1.5)
             t_indices = torch.randint(0, len(TURBO_SHIFT3_TIMESTEPS), (bsz,), device=device)
             t = timesteps_tensor[t_indices]
             t_expanded = t.unsqueeze(-1).unsqueeze(-1)
@@ -362,25 +380,24 @@ def train_lora(
             # Interpolate: x_t = t * noise + (1-t) * data
             xt = t_expanded * x1 + (1.0 - t_expanded) * x0
 
-            # Enable grad on input so PEFT LoRA layers can compute gradients
-            xt = xt.requires_grad_(True)
+            # Mixed precision: use autocast for forward pass (matches original ACE-Step 1.5)
+            # autocast keeps certain ops (softmax, loss) in fp32 for numerical stability
+            with autocast_ctx:
+                decoder_outputs = dit_model.decoder(
+                    hidden_states=xt,
+                    timestep=t,
+                    timestep_r=t,
+                    attention_mask=attention_mask,
+                    encoder_hidden_states=enc_hidden,
+                    encoder_attention_mask=enc_mask,
+                    context_latents=context_latents,
+                )
 
-            # Forward through decoder (model already in bfloat16, no autocast needed)
-            decoder_outputs = dit_model.decoder(
-                hidden_states=xt,
-                timestep=t,
-                timestep_r=t,
-                attention_mask=attention_mask,
-                encoder_hidden_states=enc_hidden,
-                encoder_attention_mask=enc_mask,
-                context_latents=context_latents,
-            )
+                # Flow matching loss: predict flow field v = x1 - x0
+                flow = x1 - x0
+                loss = F.mse_loss(decoder_outputs[0], flow)
 
-            # Flow matching loss: predict flow field v = x1 - x0
-            flow = x1 - x0
-            loss = F.mse_loss(decoder_outputs[0], flow)
-
-            # Scale loss for gradient accumulation
+            # Scale loss for gradient accumulation (float32 for stable backward)
             loss = loss.float() / gradient_accumulation
 
             # Backward
@@ -438,7 +455,7 @@ def train_lora(
                 if save_every_n_steps > 0 and global_step % save_every_n_steps == 0:
                     ckpt_name = f"{lora_name}_{global_step}steps.safetensors"
                     ckpt_path = os.path.join(output_dir, ckpt_name)
-                    save_lora_safetensors(dit_model, ckpt_path, alpha=alpha)
+                    save_lora_safetensors(dit_model, ckpt_path, alpha=alpha, rank=rank, dropout=dropout)
                     # Save training state for resume
                     state_name = f"{lora_name}_{global_step}steps_checkpoint.pt"
                     state_path = os.path.join(output_dir, state_name)
@@ -500,7 +517,7 @@ def train_lora(
             if save_every_n_steps > 0 and global_step % save_every_n_steps == 0:
                 ckpt_name = f"{lora_name}_{global_step}steps.safetensors"
                 ckpt_path = os.path.join(output_dir, ckpt_name)
-                save_lora_safetensors(dit_model, ckpt_path, alpha=alpha)
+                save_lora_safetensors(dit_model, ckpt_path, alpha=alpha, rank=rank, dropout=dropout)
                 # Save training state for resume
                 state_name = f"{lora_name}_{global_step}steps_checkpoint.pt"
                 state_path = os.path.join(output_dir, state_name)
@@ -517,7 +534,7 @@ def train_lora(
     total_time = time.time() - training_start
     final_name = f"{lora_name}_final.safetensors"
     final_path = os.path.join(output_dir, final_name)
-    save_lora_safetensors(dit_model, final_path, alpha=alpha)
+    save_lora_safetensors(dit_model, final_path, alpha=alpha, rank=rank, dropout=dropout)
 
     print("=" * 70)
     print("[AceStep Train] Training complete!")
