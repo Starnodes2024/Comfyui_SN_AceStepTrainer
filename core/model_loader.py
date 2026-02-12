@@ -94,12 +94,14 @@ def load_text_encoder(device: Optional[torch.device] = None) -> Tuple[AutoModel,
     return encoder, tokenizer
 
 
-def load_dit(device: Optional[torch.device] = None, config_name: str = "dit_turbo"):
+def load_dit(device: Optional[torch.device] = None, config_name: str = "dit_turbo",
+             quantization_config=None):
     """Load the AceStep DiT model (uses trust_remote_code for custom architecture).
 
     Args:
         device: Target device
         config_name: Which DiT to load ('dit_turbo' for training target)
+        quantization_config: Optional BitsAndBytesConfig for 4-bit/8-bit loading (QLoRA)
 
     Returns:
         DiT model
@@ -108,21 +110,39 @@ def load_dit(device: Optional[torch.device] = None, config_name: str = "dit_turb
         device = _get_device()
     dtype = _get_dtype(device)
 
-    cache_key = f"dit_{config_name}"
-    if cache_key in _model_cache:
-        _model_cache[cache_key] = _model_cache[cache_key].to(device).to(dtype)
-        return _model_cache[cache_key]
+    # Don't use cache for quantized models (they are training-only, one-shot)
+    if quantization_config is None:
+        cache_key = f"dit_{config_name}"
+        if cache_key in _model_cache:
+            _model_cache[cache_key] = _model_cache[cache_key].to(device).to(dtype)
+            return _model_cache[cache_key]
 
     dit_path = download_component(config_name)
-    print(f"[AceStep] Loading DiT model from {dit_path}...")
-    model = AutoModel.from_pretrained(
-        str(dit_path),
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-        dtype="bfloat16" if dtype == torch.bfloat16 else "float32",
-    )
-    model = model.to(device).to(dtype)
-    model.eval()
+
+    if quantization_config is not None:
+        # Quantized loading: device_map places model on GPU, skip manual .to()
+        device_idx = device.index if device.index is not None else 0
+        print(f"[AceStep] Loading DiT model (quantized) from {dit_path}...")
+        model = AutoModel.from_pretrained(
+            str(dit_path),
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+            dtype="bfloat16" if dtype == torch.bfloat16 else "float32",
+            quantization_config=quantization_config,
+            device_map={"": device_idx},
+        )
+        # Do NOT call model.to(device).to(dtype) — breaks quantized tensors
+        logger.info(f"[AceStep] DiT model loaded (quantized) on cuda:{device_idx}")
+    else:
+        print(f"[AceStep] Loading DiT model from {dit_path}...")
+        model = AutoModel.from_pretrained(
+            str(dit_path),
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+            dtype="bfloat16" if dtype == torch.bfloat16 else "float32",
+        )
+        model = model.to(device).to(dtype)
+        model.eval()
 
     # Load silence latent
     silence_path = dit_path / "silence_latent.pt"
@@ -132,8 +152,11 @@ def load_dit(device: Optional[torch.device] = None, config_name: str = "dit_turb
         silence_latent = silence_latent.to(device).to(dtype)
         logger.info("[AceStep] Silence latent loaded")
 
-    _model_cache[cache_key] = model
-    _model_cache[f"{cache_key}_silence"] = silence_latent
+    # Only cache non-quantized models
+    if quantization_config is None:
+        cache_key = f"dit_{config_name}"
+        _model_cache[cache_key] = model
+    _model_cache[f"dit_{config_name}_silence"] = silence_latent
     logger.info(f"[AceStep] DiT model loaded on {device} ({dtype})")
     return model
 

@@ -129,6 +129,7 @@ def train_lora(
     device: Optional[torch.device] = None,
     progress_callback=None,
     resume_checkpoint: Optional[str] = None,
+    quantization_mode: str = "none",
 ) -> str:
     """Train LoRA adapters on the DiT decoder using preprocessed tensors.
 
@@ -155,6 +156,7 @@ def train_lora(
         device: Target device
         progress_callback: Optional callback(step, total) for UI progress bar
         resume_checkpoint: Optional path to a _checkpoint.pt file to resume from
+        quantization_mode: 'none', 'load_in_8bit', or 'load_in_4bit' (QLoRA)
 
     Returns:
         Status message string
@@ -209,9 +211,47 @@ def train_lora(
             del _model_cache[key]
     torch.cuda.empty_cache()
 
+    # Build quantization config for QLoRA (if requested)
+    bnb_config = None
+    is_quantized = quantization_mode != "none"
+    if is_quantized:
+        if device.type != "cuda":
+            return "ERROR: QLoRA quantization requires a CUDA GPU."
+        try:
+            import bitsandbytes  # noqa: F401
+            from transformers import BitsAndBytesConfig
+        except ImportError:
+            return ("ERROR: bitsandbytes is required for QLoRA quantization. "
+                    "Install it with: pip install bitsandbytes>=0.43.0 accelerate>=0.20.0")
+
+        if quantization_mode == "load_in_4bit":
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_use_double_quant=True,
+            )
+            print("[AceStep Train] QLoRA: 4-bit NF4 quantization (double quant)")
+        elif quantization_mode == "load_in_8bit":
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+            )
+            print("[AceStep Train] QLoRA: 8-bit quantization")
+
     # Load DiT model (fresh, outside inference_mode)
     print("[AceStep Train] Loading DiT model...")
-    dit_model = load_dit(device, "dit_turbo")
+    dit_model = load_dit(device, "dit_turbo", quantization_config=bnb_config)
+
+    # QLoRA: prepare quantized model for k-bit training before LoRA injection
+    # This freezes base weights, casts norm layers to float32, and enables input grads.
+    # We pass use_gradient_checkpointing=False because the custom AceStepDiTModel
+    # doesn't implement get_input_embeddings() which gradient_checkpointing_enable() needs.
+    if is_quantized:
+        from peft import prepare_model_for_kbit_training
+        dit_model = prepare_model_for_kbit_training(
+            dit_model, use_gradient_checkpointing=False
+        )
+        print("[AceStep Train] Model prepared for QLoRA k-bit training")
 
     # Inject LoRA
     print(f"[AceStep Train] Injecting LoRA (rank={rank}, alpha={alpha})...")
@@ -234,7 +274,8 @@ def train_lora(
         "weight_decay": weight_decay,
         # Use default AdamW betas (0.9, 0.999) — matches original ACE-Step 1.5 source
     }
-    if device.type == "cuda":
+    # fused AdamW not compatible with quantized parameters on different devices
+    if device.type == "cuda" and not is_quantized:
         optimizer_kwargs["fused"] = True
     optimizer = AdamW(trainable_params, **optimizer_kwargs)
 
@@ -264,7 +305,9 @@ def train_lora(
     )
 
     # Ensure entire model is on correct device and dtype, then set decoder to train mode
-    dit_model = dit_model.to(device=device, dtype=dtype)
+    # For quantized models: skip .to() — device_map already placed it, and .to() breaks quantized tensors
+    if not is_quantized:
+        dit_model = dit_model.to(device=device, dtype=dtype)
     dit_model.decoder.train()
 
     # Resume from checkpoint if provided

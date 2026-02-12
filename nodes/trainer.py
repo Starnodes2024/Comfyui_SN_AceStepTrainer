@@ -88,6 +88,9 @@ class AceStep15LoRATrainer:
                     "max": 4294967295,
                     "tooltip": "Random seed for reproducible results. Using the same seed with the same settings and data produces identical training. Change this if you want to try a different random initialization.",
                 }),
+                "quantization_mode": (["none", "load_in_8bit", "load_in_4bit"], {
+                    "tooltip": "QLoRA: Load the base model in reduced precision to save VRAM. 'none' = full bfloat16 (~4GB model). 'load_in_8bit' = 8-bit quantization (~2GB model). 'load_in_4bit' = 4-bit NF4 quantization (~1.2GB model). Requires: pip install bitsandbytes accelerate. CUDA only. LoRA weights stay in full precision — only the frozen base model is quantized.",
+                }),
             },
             "optional": {
                 "tensor_path": ("STRING", {
@@ -108,8 +111,8 @@ class AceStep15LoRATrainer:
 
     def train(self, existing_dataset, lora_name, lora_rank, lora_alpha,
               learning_rate, epochs, batch_size, gradient_accumulation,
-              save_every_n_epochs, seed, tensor_path=None,
-              resume_from_checkpoint=None):
+              save_every_n_epochs, seed, quantization_mode="none",
+              tensor_path=None, resume_from_checkpoint=None):
 
         # Determine tensor directory
         if tensor_path and os.path.isdir(tensor_path):
@@ -151,6 +154,8 @@ class AceStep15LoRATrainer:
         print(f"  Epochs: {epochs}, Batches/epoch: {batches_per_epoch}, Total steps: {total_batches}")
         print(f"  Batch: {batch_size}, Grad accum: {gradient_accumulation}")
         print(f"  LR: {learning_rate}, Save every: {save_every_n_epochs} epochs")
+        if quantization_mode != "none":
+            print(f"  Quantization: {quantization_mode} (QLoRA)")
         if resume_path:
             print(f"  Resume from: {resume_path}")
         print("=" * 70)
@@ -182,6 +187,7 @@ class AceStep15LoRATrainer:
             num_workers=0,  # 0 avoids Windows multiprocessing issues
             progress_callback=progress_callback,
             resume_checkpoint=resume_path,
+            quantization_mode=quantization_mode,
         )
 
         return (status,)
