@@ -6,6 +6,5 @@ torchaudio
 soundfile
 safetensors
 pyyaml
-# Optional: for QLoRA quantization (4-bit/8-bit training) — CUDA only
-# bitsandbytes>=0.43.0
-# accelerate>=0.20.0
+bitsandbytes>=0.43.0
+accelerate>=0.20.0
