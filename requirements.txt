@@ -8,3 +8,4 @@ safetensors
 pyyaml
 bitsandbytes>=0.43.0
 accelerate>=0.20.0
+vector-quantize-pytorch==1.27.15
