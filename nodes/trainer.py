@@ -127,12 +127,10 @@ class AceStep15LoRATrainer:
         if not pt_files:
             return (f"ERROR: No .pt tensor files found in {tensor_dir}. Run Preprocessor first.",)
 
-        # Calculate max_steps and save interval from epochs
+        # Calculate total batches for progress bar display
         num_samples = len(pt_files)
         batches_per_epoch = math.ceil(num_samples / batch_size)
-        steps_per_epoch = max(1, math.ceil(batches_per_epoch / gradient_accumulation))
-        max_steps = epochs * steps_per_epoch
-        save_every_n_steps = save_every_n_epochs * steps_per_epoch if save_every_n_epochs > 0 else 0
+        total_batches = epochs * batches_per_epoch
 
         # Output directory
         output_dir = str(get_trained_dir(lora_name))
@@ -150,15 +148,15 @@ class AceStep15LoRATrainer:
         print(f"  Dataset: {tensor_dir} ({num_samples} samples)")
         print(f"  Output: {output_dir}")
         print(f"  LoRA: rank={lora_rank}, alpha={lora_alpha}")
-        print(f"  Epochs: {epochs}, Steps/epoch: {steps_per_epoch}, Total steps: {max_steps}")
+        print(f"  Epochs: {epochs}, Batches/epoch: {batches_per_epoch}, Total steps: {total_batches}")
         print(f"  Batch: {batch_size}, Grad accum: {gradient_accumulation}")
-        print(f"  LR: {learning_rate}, Save every: {save_every_n_epochs} epochs ({save_every_n_steps} steps)")
+        print(f"  LR: {learning_rate}, Save every: {save_every_n_epochs} epochs")
         if resume_path:
             print(f"  Resume from: {resume_path}")
         print("=" * 70)
 
         # Create ComfyUI progress bar (shows on the node during training)
-        pbar = ProgressBar(max_steps)
+        pbar = ProgressBar(total_batches)
         pbar_pos = 0
 
         def progress_callback(step, total):
@@ -176,10 +174,10 @@ class AceStep15LoRATrainer:
             rank=lora_rank,
             alpha=lora_alpha,
             learning_rate=learning_rate,
-            max_steps=max_steps,
+            num_epochs=epochs,
             batch_size=batch_size,
             gradient_accumulation=gradient_accumulation,
-            save_every_n_steps=save_every_n_steps,
+            save_every_n_epochs=save_every_n_epochs,
             seed=seed,
             num_workers=0,  # 0 avoids Windows multiprocessing issues
             progress_callback=progress_callback,

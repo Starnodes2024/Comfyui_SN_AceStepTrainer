@@ -117,10 +117,10 @@ def train_lora(
     alpha: int = 128,
     dropout: float = 0.1,
     learning_rate: float = 1e-4,
-    max_steps: int = 500,
+    num_epochs: int = 100,
     batch_size: int = 1,
     gradient_accumulation: int = 4,
-    save_every_n_steps: int = 250,
+    save_every_n_epochs: int = 10,
     warmup_steps: int = 100,
     weight_decay: float = 0.01,
     max_grad_norm: float = 1.0,
@@ -143,10 +143,10 @@ def train_lora(
         alpha: LoRA alpha
         dropout: LoRA dropout
         learning_rate: Initial learning rate
-        max_steps: Total number of optimizer steps to train
+        num_epochs: Number of full passes through the dataset
         batch_size: Training batch size
         gradient_accumulation: Gradient accumulation steps
-        save_every_n_steps: Save checkpoint every N global steps
+        save_every_n_epochs: Save checkpoint every N epochs (0 = only final)
         warmup_steps: Warmup steps for LR scheduler
         weight_decay: AdamW weight decay
         max_grad_norm: Max gradient norm for clipping
@@ -241,7 +241,9 @@ def train_lora(
     # LR scheduler: linear warmup then cosine annealing (matches original ACE-Step 1.5 source)
     batches_per_epoch = len(dataloader)
     steps_per_epoch = max(1, math.ceil(batches_per_epoch / gradient_accumulation))
-    warmup_steps = min(warmup_steps, max(1, max_steps // 10))
+    total_optimizer_steps = num_epochs * steps_per_epoch
+    total_batches = num_epochs * batches_per_epoch  # forward passes — used for display
+    warmup_steps = min(warmup_steps, max(1, total_optimizer_steps // 10))
 
     warmup_scheduler = LinearLR(
         optimizer,
@@ -251,7 +253,7 @@ def train_lora(
     )
     main_scheduler = CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=max(1, max_steps - warmup_steps),
+        T_0=max(1, total_optimizer_steps - warmup_steps),
         T_mult=1,
         eta_min=learning_rate * 0.01,
     )
@@ -309,26 +311,25 @@ def train_lora(
     print("[AceStep Train] Starting training:")
     print(f"  Device: {device}, Precision: {dtype}")
     print(f"  Samples: {len(dataset)}, Batch: {batch_size}, Grad accum: {gradient_accumulation}")
-    print(f"  Max steps: {max_steps}, Steps/epoch: {steps_per_epoch}")
-    print(f"  LR: {learning_rate}, Warmup: {warmup_steps} steps")
-    print(f"  Save every: {save_every_n_steps} steps")
-    if save_every_n_steps > 0 and save_every_n_steps > max_steps:
-        print(f"  WARNING: save_every_n_steps ({save_every_n_steps}) > max_steps ({max_steps})")
-        print("    Only the final LoRA will be saved. Lower save_every_n_steps for intermediate saves.")
+    print(f"  Epochs: {num_epochs}, Batches/epoch: {batches_per_epoch}, Total steps: {total_batches}")
+    print(f"  Optimizer steps/epoch: {steps_per_epoch}, Total optimizer steps: {total_optimizer_steps}")
+    print(f"  LR: {learning_rate}, Warmup: {warmup_steps} optimizer steps")
+    print(f"  Save every: {save_every_n_epochs} epochs")
     print(f"  Output: {output_dir}")
     print("=" * 70)
 
     # Build config dict for checkpoint saving
     _train_config = {
         "rank": rank, "alpha": alpha, "dropout": dropout,
-        "learning_rate": learning_rate, "max_steps": max_steps,
+        "learning_rate": learning_rate, "num_epochs": num_epochs,
         "batch_size": batch_size, "gradient_accumulation": gradient_accumulation,
         "warmup_steps": warmup_steps, "weight_decay": weight_decay,
         "seed": seed, "lora_name": lora_name,
     }
 
     # Training loop
-    global_step = resume_step
+    global_step = resume_step          # optimizer steps (for scheduler)
+    batch_step = resume_epoch * batches_per_epoch  # forward passes (for display)
     accumulation_step = 0
     accumulated_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
@@ -344,20 +345,18 @@ def train_lora(
         autocast_ctx = nullcontext()
 
     # Fast-forward the progress bar if resuming
-    if resume_step > 0 and progress_callback is not None:
-        progress_callback(resume_step, max_steps)
+    if batch_step > 0 and progress_callback is not None:
+        progress_callback(batch_step, total_batches)
 
     # Notify frontend that training has started
-    _send_training_event({"type": "start", "max_steps": max_steps, "resume_step": resume_step})
+    _send_training_event({"type": "start", "max_steps": total_batches, "resume_step": batch_step})
 
-    done = False
-    if global_step >= max_steps:
-        done = True
-    epoch = resume_epoch
-    while not done:
-        epoch += 1
+    start_epoch = resume_epoch + 1
+    for epoch in range(start_epoch, num_epochs + 1):
 
         for batch_idx, batch in enumerate(dataloader):
+            batch_step += 1
+
             # Move batch to device
             target_latents = batch["target_latents"].to(device, dtype=dtype, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, dtype=dtype, non_blocking=True)
@@ -419,56 +418,41 @@ def train_lora(
 
                 # Update ComfyUI progress bar
                 if progress_callback is not None:
-                    progress_callback(global_step, max_steps)
+                    progress_callback(batch_step, total_batches)
 
                 # Compute ETA and LR for logging + WebSocket
                 lr = scheduler.get_last_lr()[0]
                 elapsed = time.time() - training_start
-                steps_per_sec = global_step / elapsed if elapsed > 0 else 0
-                remaining_steps = max_steps - global_step
-                eta_sec = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
+                done_batches = batch_step - (resume_epoch * batches_per_epoch)
+                batches_per_sec = done_batches / elapsed if elapsed > 0 else 0
+                remaining = total_batches - batch_step
+                eta_sec = remaining / batches_per_sec if batches_per_sec > 0 else 0
                 eta_min, eta_s = divmod(int(eta_sec), 60)
                 eta_h, eta_min = divmod(eta_min, 60)
                 elapsed_min = int(elapsed) // 60
                 elapsed_s = int(elapsed) % 60
                 eta_str = f"{eta_h}h{eta_min:02d}m" if eta_h > 0 else f"{eta_min}m{eta_s:02d}s"
 
-                # Send every step to the loss graph widget
+                # Send every optimizer step to the loss graph widget
                 _send_training_event({
                     "type": "step",
-                    "step": global_step,
+                    "step": batch_step,
                     "loss": avg_loss,
                     "lr": lr,
                     "eta": eta_str,
                 })
 
-                # Log progress to console (every 10 steps to avoid spam)
+                # Log progress to console (every 10 optimizer steps to avoid spam)
                 if global_step % 10 == 0 or global_step == 1:
                     print(
-                        f"[AceStep Train] Step {global_step}/{max_steps} | "
+                        f"[AceStep Train] Step {batch_step}/{total_batches} | "
+                        f"Epoch {epoch}/{num_epochs} | "
                         f"Loss: {avg_loss:.6f} | LR: {lr:.2e} | "
-                        f"{steps_per_sec:.2f} steps/s | "
                         f"Elapsed: {elapsed_min}m{elapsed_s:02d}s | ETA: {eta_str}"
                     )
 
-                # Save checkpoint at interval (LoRA weights + training state)
-                if save_every_n_steps > 0 and global_step % save_every_n_steps == 0:
-                    ckpt_name = f"{lora_name}_{global_step}steps.safetensors"
-                    ckpt_path = os.path.join(output_dir, ckpt_name)
-                    save_lora_safetensors(dit_model, ckpt_path, alpha=alpha, rank=rank, dropout=dropout)
-                    # Save training state for resume
-                    state_name = f"{lora_name}_{global_step}steps_checkpoint.pt"
-                    state_path = os.path.join(output_dir, state_name)
-                    _save_training_checkpoint(state_path, dit_model, optimizer, scheduler, global_step, epoch, _train_config)
-                    print(f"[AceStep Train] Checkpoint saved: {ckpt_name} + {state_name}")
-
-                # Check if we've reached max_steps
-                if global_step >= max_steps:
-                    done = True
-                    break
-
-        # Flush remaining accumulated gradients at end of data pass
-        if not done and accumulation_step > 0:
+        # Flush remaining accumulated gradients at end of epoch
+        if accumulation_step > 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
             optimizer.step()
             scheduler.step()
@@ -479,53 +463,46 @@ def train_lora(
             accumulated_loss = 0.0
             accumulation_step = 0
 
-            # Update ComfyUI progress bar
             if progress_callback is not None:
-                progress_callback(global_step, max_steps)
+                progress_callback(batch_step, total_batches)
 
-            # Compute ETA and LR for logging + WebSocket
             lr = scheduler.get_last_lr()[0]
             elapsed = time.time() - training_start
-            steps_per_sec = global_step / elapsed if elapsed > 0 else 0
-            remaining_steps = max_steps - global_step
-            eta_sec = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
+            done_batches = batch_step - (resume_epoch * batches_per_epoch)
+            batches_per_sec = done_batches / elapsed if elapsed > 0 else 0
+            remaining = total_batches - batch_step
+            eta_sec = remaining / batches_per_sec if batches_per_sec > 0 else 0
             eta_min, eta_s = divmod(int(eta_sec), 60)
             eta_h, eta_min = divmod(eta_min, 60)
             elapsed_min = int(elapsed) // 60
             elapsed_s = int(elapsed) % 60
             eta_str = f"{eta_h}h{eta_min:02d}m" if eta_h > 0 else f"{eta_min}m{eta_s:02d}s"
 
-            # Send every step to the loss graph widget
             _send_training_event({
                 "type": "step",
-                "step": global_step,
+                "step": batch_step,
                 "loss": avg_loss,
                 "lr": lr,
                 "eta": eta_str,
             })
 
-            # Log progress to console (every 10 steps to avoid spam)
             if global_step % 10 == 0 or global_step == 1:
                 print(
-                    f"[AceStep Train] Step {global_step}/{max_steps} | "
+                    f"[AceStep Train] Step {batch_step}/{total_batches} | "
+                    f"Epoch {epoch}/{num_epochs} | "
                     f"Loss: {avg_loss:.6f} | LR: {lr:.2e} | "
-                    f"{steps_per_sec:.2f} steps/s | "
                     f"Elapsed: {elapsed_min}m{elapsed_s:02d}s | ETA: {eta_str}"
                 )
 
-            # Save checkpoint at interval (LoRA weights + training state)
-            if save_every_n_steps > 0 and global_step % save_every_n_steps == 0:
-                ckpt_name = f"{lora_name}_{global_step}steps.safetensors"
-                ckpt_path = os.path.join(output_dir, ckpt_name)
-                save_lora_safetensors(dit_model, ckpt_path, alpha=alpha, rank=rank, dropout=dropout)
-                # Save training state for resume
-                state_name = f"{lora_name}_{global_step}steps_checkpoint.pt"
-                state_path = os.path.join(output_dir, state_name)
-                _save_training_checkpoint(state_path, dit_model, optimizer, scheduler, global_step, epoch, _train_config)
-                print(f"[AceStep Train] Checkpoint saved: {ckpt_name} + {state_name}")
-
-            if global_step >= max_steps:
-                done = True
+        # Save checkpoint every N epochs (LoRA weights + training state)
+        if save_every_n_epochs > 0 and epoch % save_every_n_epochs == 0:
+            ckpt_name = f"{lora_name}_{batch_step}steps.safetensors"
+            ckpt_path = os.path.join(output_dir, ckpt_name)
+            save_lora_safetensors(dit_model, ckpt_path, alpha=alpha, rank=rank, dropout=dropout)
+            state_name = f"{lora_name}_{batch_step}steps_checkpoint.pt"
+            state_path = os.path.join(output_dir, state_name)
+            _save_training_checkpoint(state_path, dit_model, optimizer, scheduler, global_step, epoch, _train_config)
+            print(f"[AceStep Train] Epoch {epoch}/{num_epochs} — Checkpoint saved: {ckpt_name}")
 
     # Save final LoRA
     total_time = time.time() - training_start
@@ -538,7 +515,7 @@ def train_lora(
 
     print("=" * 70)
     print("[AceStep Train] Training complete!")
-    print(f"  Total steps: {global_step}")
+    print(f"  Epochs: {num_epochs}, Optimizer steps: {global_step}, Batches: {batch_step}")
     print(f"  Total time: {total_time:.1f}s ({total_time/60:.1f}min)")
     print(f"  Final LoRA: {final_path}")
     print("=" * 70)
@@ -552,4 +529,4 @@ def train_lora(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return f"Training complete! {global_step} steps in {total_time/60:.1f}min. LoRA saved to: {final_path}"
+    return f"Training complete! {num_epochs} epochs ({batch_step} steps) in {total_time/60:.1f}min. LoRA saved to: {final_path}"
